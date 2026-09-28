@@ -9,8 +9,6 @@ import { startScheduler, makeJobId } from './operations.js';
 import { impliedProbability, valueMetrics, marketProbability, rankValue } from './intelligence.js';
 import { makeRunId } from './automation.js';
 import { rateLimit, safeCompare } from './security.js';
-import { ensembleModels, walkForward, calibration as advancedCalibration, leaguePerformance } from './advanced_models.js';
-import { summarizeStore, coverage } from './data_engine.js';
 
 dotenv.config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -434,7 +432,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     service: 'CRATTO CTRL',
-    model: 'CRATTO-CTRL-30.0-INTELLIGENCE-CORE',
+    model: 'CRATTO-CTRL-24.0-AUTH-PORTFOLIO',
     providerConfigured: Boolean(process.env.FOOTBALL_DATA_API_KEY),
     storedMatches: store.matches.length,
     storedPredictions: store.predictions.length,
@@ -550,7 +548,7 @@ app.get('/api/backtest', (req, res) => {
   const brier = results.length ? results.reduce((s, x) => s + x.brier, 0) / results.length : null;
   const logLoss = results.length ? results.reduce((s,x)=>s+x.logLoss,0)/results.length : null;
   res.json({
-    model: 'CRATTO-CTRL-30.0-INTELLIGENCE-CORE',
+    model: 'CRATTO-CTRL-24.0-AUTH-PORTFOLIO',
     evaluated: results.length,
     accuracy,
     brierScore: brier,
@@ -566,7 +564,7 @@ app.get('/api/model/summary', (req, res) => {
   for (const m of finished) { if (m.homeTeam?.id) teams.add(m.homeTeam.id); if (m.awayTeam?.id) teams.add(m.awayTeam.id); }
   const totalGoals = finished.reduce((s,m) => s + Number(m.score?.fullTime?.home ?? 0) + Number(m.score?.fullTime?.away ?? 0), 0);
   res.json({
-    model: 'CRATTO-CTRL-30.0-INTELLIGENCE-CORE',
+    model: 'CRATTO-CTRL-24.0-AUTH-PORTFOLIO',
     historicalMatches: finished.length,
     teamsObserved: teams.size,
     averageGoalsPerMatch: finished.length ? Number((totalGoals / finished.length).toFixed(3)) : null,
@@ -625,7 +623,7 @@ app.get('/api/analytics', (req, res) => {
     matches: store.matches.length,
     predictions: store.predictions.length,
     finished,
-    model: 'CRATTO-CTRL-30.0-INTELLIGENCE-CORE',
+    model: 'CRATTO-CTRL-24.0-AUTH-PORTFOLIO',
     dataQuality: finished >= 300 ? 'GOOD' : finished >= 100 ? 'FAIR' : 'LOW',
     lastProviderSync: store.meta?.lastProviderSync || null,
     lastHistoricalSync: store.meta?.lastHistoricalSync || null
@@ -676,7 +674,7 @@ app.post('/api/operations/run', async (req,res)=>{
 });
 
 app.get('/api/models', async (req,res)=>{
-  const models = dbEnabled ? await listModels() : [{version:'CRATTO-CTRL-30.0-INTELLIGENCE-CORE',name:'Intelligence + value ensemble',status:'ACTIVE',metrics:{}}];
+  const models = dbEnabled ? await listModels() : [{version:'CRATTO-CTRL-25.0-INTELLIGENCE',name:'Intelligence + value ensemble',status:'ACTIVE',metrics:{}}];
   res.json({models});
 });
 app.post('/api/models/register', async (req,res)=>{
@@ -810,42 +808,6 @@ app.get('/api/admin/summary',async(req,res)=>{
   res.json({database:dbEnabled,users:stats.users,slips:stats.slips,matches:store.matches.length,predictions:store.predictions.length,lastProviderSync:store.meta.lastProviderSync||null,lastHistoricalSync:store.meta.lastHistoricalSync||null});
 });
 
-
-app.get('/api/intelligence/overview', (req,res)=>{
-  try{
-    const store=readStore(), finished=store.matches.filter(m=>m.status==='FINISHED');
-    const wf=walkForward(finished, Number(req.query.limit||500));
-    const cal=advancedCalibration(finished, Number(req.query.limit||500));
-    const leagues=leaguePerformance(finished);
-    res.json({version:'CRATTO-CTRL-30.0-INTELLIGENCE-CORE',data:summarizeStore(store),coverage:coverage(store),walkForward:{evaluated:wf.evaluated,accuracy:wf.accuracy,brier:wf.brier,logLoss:wf.logLoss},calibration:cal.bins,leaguePerformance:leagues.slice(0,30),note:'Historical estimates only; no future outcome is guaranteed.'});
-  }catch(e){res.status(500).json({error:e.message});}
-});
-
-app.get('/api/intelligence/backtest', (req,res)=>{
-  try{ const store=readStore(); const r=walkForward(store.matches.filter(m=>m.status==='FINISHED'),Number(req.query.limit||500)); res.json({model:'CRATTO-CTRL-30.0-ENSEMBLE',...r}); }
-  catch(e){res.status(500).json({error:e.message});}
-});
-
-app.get('/api/intelligence/calibration', (req,res)=>{
-  try{ const store=readStore(); res.json(advancedCalibration(store.matches.filter(m=>m.status==='FINISHED'),Number(req.query.limit||500))); }
-  catch(e){res.status(500).json({error:e.message});}
-});
-
-app.get('/api/intelligence/leagues', (req,res)=>{
-  try{ const store=readStore(); res.json({leagues:leaguePerformance(store.matches.filter(m=>m.status==='FINISHED'))}); }
-  catch(e){res.status(500).json({error:e.message});}
-});
-
-app.post('/api/intelligence/predict', (req,res)=>{
-  try{
-    const match=req.body?.match; if(!match?.homeTeam?.id || !match?.awayTeam?.id) return res.status(400).json({error:'A complete match object is required.'});
-    const store=readStore(), history=store.matches.filter(m=>m.status==='FINISHED');
-    res.json({prediction:ensembleModels(match,history),sampleSize:history.length});
-  }catch(e){res.status(400).json({error:e.message});}
-});
-
-app.get('/api/intelligence/coverage', (req,res)=>{ const store=readStore(); res.json({summary:summarizeStore(store),coverage:coverage(store)}); });
-
 app.use(express.static(path.join(__dirname, 'public')));
 app.use((req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
@@ -854,8 +816,8 @@ app.use((req,res,next)=>{ if(req.path.startsWith('/api/')) return next(); res.se
 let scheduler = null;
 initDb().then(async () => {
   if (dbEnabled) {
-    await upsertModel({version:'CRATTO-CTRL-30.0-INTELLIGENCE-CORE',name:'Intelligence + value ensemble',status:'ACTIVE',metrics:{family:'poisson+elo+form'}});
+    await upsertModel({version:'CRATTO-CTRL-25.0-INTELLIGENCE',name:'Intelligence + value ensemble',status:'ACTIVE',metrics:{family:'poisson+elo+form'}});
   }
   scheduler = startScheduler({syncProvider:scheduledSync, refreshPredictions:scheduledPredictions, intervalMinutes:Number(process.env.SYNC_INTERVAL_MINUTES||30)});
-  app.listen(PORT, HOST, () => console.log(`CRATTO CTRL v30 listening on http://${HOST}:${PORT} | database=${dbEnabled} | scheduler=${scheduler.intervalMinutes}m`));
+  app.listen(PORT, HOST, () => console.log(`CRATTO CTRL v25 listening on http://${HOST}:${PORT} | database=${dbEnabled} | scheduler=${scheduler.intervalMinutes}m`));
 }).catch(err => { console.error('Database initialization failed:', err); process.exit(1); });
