@@ -2,7 +2,9 @@ import express from 'express';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import { dbEnabled, initDb, getUserByEmail, getUserById, createUser, createSession, getSession, deleteSession, listUserSlips, createSlip, getSlipByCode, adminStats } from './db.js';
 
 dotenv.config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -15,10 +17,15 @@ const API = 'https://api.football-data.org/v4';
 const storePath = path.join(__dirname, 'data', 'store.json');
 
 function readStore() {
-  try { return JSON.parse(fs.readFileSync(storePath, 'utf8')); }
-  catch { return { matches: [], predictions: [], evaluations: [], meta: {} }; }
+  try {
+    const s = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+    s.matches ??= []; s.predictions ??= []; s.evaluations ??= []; s.meta ??= {};
+    s.users ??= []; s.sessions ??= []; s.slips ??= [];
+    return s;
+  } catch { return { matches: [], predictions: [], evaluations: [], meta: {}, users: [], sessions: [], slips: [] }; }
 }
 function writeStore(store) {
+  store.users ??= []; store.sessions ??= []; store.slips ??= [];
   fs.mkdirSync(path.dirname(storePath), { recursive: true });
   fs.writeFileSync(storePath, JSON.stringify(store, null, 2));
 }
@@ -136,11 +143,105 @@ function predict(match, history) {
     confidence,
     risk: confidence >= 0.70 ? 'LOW' : confidence >= 0.58 ? 'MEDIUM' : 'HIGH',
     features: { home, away, leagueGoalRate: league },
-    modelVersion: 'CRATTO-CTRL-11.0-Poisson'
+    modelVersion: 'CRATTO-CTRL-12.0-Poisson'
+    ,dataSufficiency: { homeMatches: home.n, awayMatches: away.n, sufficient: home.n >= 5 && away.n >= 5 }
   };
 }
 
-function predictionForMatch(match, history) { return predict(match, history); }
+
+function eloRatings(matches) {
+  const ratings = new Map();
+  const K = 24;
+  const homeAdv = 55;
+  const get = id => ratings.has(id) ? ratings.get(id) : 1500;
+  const finished = [...matches].filter(m => m.status === 'FINISHED').sort((a,b)=>new Date(a.utcDate)-new Date(b.utcDate));
+  for (const m of finished) {
+    const h = m.homeTeam?.id, a = m.awayTeam?.id;
+    if (!h || !a) continue;
+    const hg = Number(m.score?.fullTime?.home ?? 0), ag = Number(m.score?.fullTime?.away ?? 0);
+    const rh = get(h), ra = get(a);
+    const eh = 1 / (1 + Math.pow(10, ((ra - (rh + homeAdv)) / 400)));
+    const outcome = hg > ag ? 1 : hg === ag ? .5 : 0;
+    const margin = Math.min(1.5, 1 + Math.log1p(Math.abs(hg-ag)) * .18);
+    ratings.set(h, rh + K * margin * (outcome - eh));
+    ratings.set(a, ra + K * margin * ((1-outcome) - (1-eh)));
+  }
+  return ratings;
+}
+function eloProbabilities(match, ratings) {
+  const rh = ratings.get(match.homeTeam.id) ?? 1500;
+  const ra = ratings.get(match.awayTeam.id) ?? 1500;
+  const x = (rh + 55 - ra) / 400;
+  const homeNonDraw = 1 / (1 + Math.pow(10, -x));
+  const draw = clamp(0.27 - Math.min(.08, Math.abs(x) * .06), .16, .29);
+  return { homeWin: homeNonDraw * (1-draw), draw, awayWin: (1-homeNonDraw) * (1-draw) };
+}
+function trend(teamId, matches, limit=8) {
+  const games = matches.filter(m=>m.status==='FINISHED' && (m.homeTeam?.id===teamId || m.awayTeam?.id===teamId))
+    .sort((a,b)=>new Date(a.utcDate)-new Date(b.utcDate)).slice(-limit);
+  if (games.length < 4) return { slope: 0, direction: 'STABLE' };
+  const vals = games.map(m=>{
+    const home=m.homeTeam.id===teamId, gf=Number(m.score?.fullTime?.home??0), ga=Number(m.score?.fullTime?.away??0);
+    return home ? gf-ga : ga-gf;
+  });
+  const n=vals.length, xbar=(n-1)/2, ybar=vals.reduce((a,b)=>a+b,0)/n;
+  const den=vals.reduce((a,_,i)=>a+(i-xbar)**2,0)||1;
+  const slope=vals.reduce((a,y,i)=>a+(i-xbar)*(y-ybar),0)/den;
+  return { slope:Number(slope.toFixed(3)), direction:slope>.08?'UP':slope<-.08?'DOWN':'STABLE' };
+}
+function ensemblePrediction(match, history) {
+  const base = predict(match, history);
+  const ratings = eloRatings(history);
+  const elo = eloProbabilities(match, ratings);
+  const formHome = base.features.home.ppg, formAway = base.features.away.ppg;
+  const formEdge = clamp(.5 + (formHome-formAway)/6, .18, .82);
+  const form = { homeWin: formEdge*.72, draw:.28, awayWin:(1-formEdge)*.72 };
+  const weights = history.length >= 100 ? { poisson:.55, elo:.30, form:.15 } : { poisson:.70, elo:.20, form:.10 };
+  const probs3 = {
+    homeWin: clamp(weights.poisson*base.probabilities.homeWin + weights.elo*elo.homeWin + weights.form*form.homeWin),
+    draw: clamp(weights.poisson*base.probabilities.draw + weights.elo*elo.draw + weights.form*form.draw),
+    awayWin: clamp(weights.poisson*base.probabilities.awayWin + weights.elo*elo.awayWin + weights.form*form.awayWin)
+  };
+  const sum=probs3.homeWin+probs3.draw+probs3.awayWin;
+  probs3.homeWin/=sum; probs3.draw/=sum; probs3.awayWin/=sum;
+  const markets={HOME_WIN:probs3.homeWin,DRAW:probs3.draw,AWAY_WIN:probs3.awayWin,OVER_2_5:base.probabilities.over25,BTTS:base.probabilities.btts};
+  const ranked=Object.entries(markets).sort((a,b)=>b[1]-a[1]);
+  const entropy=-[probs3.homeWin,probs3.draw,probs3.awayWin].reduce((s,p)=>s+(p>0?p*Math.log(p):0),0)/Math.log(3);
+  const calibrationFactor=history.length>=150 ? .98 : history.length>=50 ? .94 : .88;
+  const confidence=clamp(ranked[0][1]*(1-.16*entropy)*calibrationFactor);
+  const ht=trend(match.homeTeam.id,history), at=trend(match.awayTeam.id,history);
+  return {...base, probabilities:{...base.probabilities,...probs3}, recommendedMarket:ranked[0][0], rawTopProbability:ranked[0][1], confidence,
+    risk:confidence>=.70?'LOW':confidence>=.58?'MEDIUM':'HIGH', modelVersion:'CRATTO-CTRL-24.0-AUTH-PORTFOLIO',
+    modelBlend:weights, elo:{home:ratings.get(match.homeTeam.id)??1500,away:ratings.get(match.awayTeam.id)??1500,probabilities:elo}, trend:{home:ht,away:at}, calibrationFactor};
+}
+function evaluateEnsemble(pred, match) {
+  const e=evaluatePrediction(pred,match);
+  const arr=[pred.probabilities.homeWin,pred.probabilities.draw,pred.probabilities.awayWin];
+  const actual=match.score.fullTime.home>match.score.fullTime.away?0:match.score.fullTime.home===match.score.fullTime.away?1:2;
+  e.logLoss=-Math.log(Math.max(1e-9,arr[actual]));
+  return e;
+}
+function correlationScore(a,b) {
+  if (a.recommendedMarket===b.recommendedMarket) return .8;
+  const homeAway = new Set([a.home,a.away,a.matchId,b.home,b.away,b.matchId]);
+  if (homeAway.size < 6) return .55;
+  if ((a.probabilities?.over25 && b.probabilities?.btts) || (a.probabilities?.btts && b.probabilities?.over25)) return .35;
+  return 0;
+}
+function buildPortfolio(predictions, opts={}) {
+  const maxSelections=Math.max(1,Math.min(20,Number(opts.maxSelections||5)));
+  const minConfidence=clamp(Number(opts.minConfidence??.65));
+  const risk=opts.risk||'ALL';
+  const pool=predictions.filter(p=>p.confidence>=minConfidence&&(risk==='ALL'||p.risk===risk)).sort((a,b)=>b.confidence-a.confidence);
+  const selected=[];
+  for(const p of pool){
+    if(selected.length>=maxSelections) break;
+    const tooCorrelated=selected.some(x=>correlationScore(x,p)>=.75);
+    if(!tooCorrelated) selected.push(p);
+  }
+  return selected;
+}
+
 
 function evaluatePrediction(prediction, match) {
   const hg = Number(match.score?.fullTime?.home ?? 0);
@@ -159,17 +260,124 @@ function evaluatePrediction(prediction, match) {
   };
 }
 
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return `${salt}:${hash}`;
+}
+function verifyPassword(password, stored) {
+  const [salt, hash] = String(stored || '').split(':');
+  if (!salt || !hash) return false;
+  const derived = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(derived, 'hex'));
+}
+function token() { return crypto.randomBytes(32).toString('hex'); }
+function shareCode() { return `CCTRL-${crypto.randomBytes(4).toString('hex').toUpperCase()}`; }
+function safeUser(u) { return u ? { id:u.id, name:u.name, email:u.email, createdAt:u.createdAt } : null; }
+async function authUser(req) {
+  const raw = req.headers.authorization || '';
+  const bearer = raw.startsWith('Bearer ') ? raw.slice(7) : null;
+  const cookie = (req.headers.cookie || '').split(';').map(x=>x.trim()).find(x=>x.startsWith('cctrl_session='));
+  const t = bearer || (cookie ? cookie.slice('cctrl_session='.length) : null);
+  if (!t) return null;
+  if (dbEnabled) {
+    const session = await getSession(t);
+    if (!session) return null;
+    return await getUserById(session.user_id);
+  }
+  const store = readStore();
+  const session = store.sessions.find(s=>s.token===t && new Date(s.expiresAt)>new Date());
+  if (!session) return null;
+  return store.users.find(u=>u.id===session.userId) || null;
+}
+async function requireAuth(req,res,next) {
+  try { const user = await authUser(req); if (!user) return res.status(401).json({error:'Login required'}); req.user = user; next(); }
+  catch(e) { res.status(500).json({error:e.message}); }
+}
+function validateEmail(email) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email||'')); }
+
+app.post('/api/auth/register', async (req,res)=>{
+  try {
+    const name=String(req.body.name||'').trim(), email=String(req.body.email||'').trim().toLowerCase(), password=String(req.body.password||'');
+    if(name.length<2 || !validateEmail(email) || password.length<8) return res.status(400).json({error:'Name, valid email and password of at least 8 characters are required.'});
+    const user={id:crypto.randomUUID(),name,email,passwordHash:hashPassword(password),createdAt:new Date().toISOString(),role:'user'};
+    if(dbEnabled) {
+      if(await getUserByEmail(email)) return res.status(409).json({error:'An account with that email already exists.'});
+      await createUser(user);
+      const session={token:token(),userId:user.id,createdAt:new Date().toISOString(),expiresAt:new Date(Date.now()+1000*60*60*24*30).toISOString()};
+      await createSession(session);
+      return res.json({user:safeUser(user),token:session.token});
+    }
+    const store=readStore();
+    if(store.users.some(u=>u.email===email)) return res.status(409).json({error:'An account with that email already exists.'});
+    const session={token:token(),userId:user.id,createdAt:new Date().toISOString(),expiresAt:new Date(Date.now()+1000*60*60*24*30).toISOString()};
+    store.users.push(user); store.sessions.push(session); writeStore(store);
+    res.json({user:safeUser(user),token:session.token});
+  } catch(e){res.status(500).json({error:e.message});}
+});
+app.post('/api/auth/login',async(req,res)=>{
+  const email=String(req.body.email||'').trim().toLowerCase(), password=String(req.body.password||'');
+  try {
+    if(dbEnabled){
+      const user=await getUserByEmail(email);
+      if(!user || !verifyPassword(password,user.password_hash)) return res.status(401).json({error:'Invalid email or password.'});
+      const session={token:token(),userId:user.id,createdAt:new Date().toISOString(),expiresAt:new Date(Date.now()+1000*60*60*24*30).toISOString()};
+      await createSession(session); return res.json({user:{id:user.id,name:user.name,email:user.email,createdAt:user.created_at,role:user.role},token:session.token});
+    }
+    const store=readStore(), user=store.users.find(u=>u.email===email);
+    if(!user || !verifyPassword(password,user.passwordHash)) return res.status(401).json({error:'Invalid email or password.'});
+    const session={token:token(),userId:user.id,createdAt:new Date().toISOString(),expiresAt:new Date(Date.now()+1000*60*60*24*30).toISOString()};
+    store.sessions=store.sessions.filter(s=>new Date(s.expiresAt)>new Date()).slice(-5000); store.sessions.push(session); writeStore(store);
+    res.json({user:safeUser(user),token:session.token});
+  } catch(e){res.status(500).json({error:e.message});}
+});
+app.post('/api/auth/logout',async(req,res)=>{
+  try { const raw=req.headers.authorization||''; const t=raw.startsWith('Bearer ')?raw.slice(7):null; if(t && dbEnabled) await deleteSession(t); else if(t){const store=readStore(); store.sessions=store.sessions.filter(s=>s.token!==t); writeStore(store);} res.json({ok:true}); } catch(e){res.status(500).json({error:e.message});}
+});
+app.get('/api/auth/me',async(req,res)=>{ const u=await authUser(req); res.json({authenticated:Boolean(u),user:safeUser(u)}); });
+
+app.get('/api/account/slips',requireAuth,async(req,res)=>{
+  if(dbEnabled) return res.json({slips:await listUserSlips(req.user.id)});
+  const store=readStore(); res.json({slips:store.slips.filter(s=>s.userId===req.user.id).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).slice(0,100).map(({userId,...s})=>s)});
+});
+app.post('/api/slips',requireAuth,async(req,res)=>{
+  try {
+    const selections=Array.isArray(req.body.selections)?req.body.selections.slice(0,20):[];
+    if(!selections.length) return res.status(400).json({error:'At least one selection is required.'});
+    const slip={id:crypto.randomUUID(),userId:req.user.id,code:shareCode(),selections,stake:Number(req.body.stake||0),budget:Number(req.body.budget||0),createdAt:new Date().toISOString(),status:'DRAFT'};
+    if(dbEnabled){
+      const created=await createSlip(slip); return res.json({slip:created});
+    }
+    const store=readStore(); while(store.slips.some(s=>s.code===slip.code)) slip.code=shareCode(); store.slips.push(slip); writeStore(store); res.json({slip:{...slip,userId:undefined}});
+  } catch(e){res.status(500).json({error:e.message});}
+});
+app.get('/api/slips/code/:code',async(req,res)=>{
+  try {
+    const code=String(req.params.code).toUpperCase();
+    if(dbEnabled){const slip=await getSlipByCode(code); if(!slip)return res.status(404).json({error:'Slip code not found.'}); return res.json({slip});}
+    const store=readStore(), slip=store.slips.find(s=>s.code.toUpperCase()===code); if(!slip) return res.status(404).json({error:'Slip code not found.'}); const {userId,...publicSlip}=slip; res.json({slip:publicSlip});
+  } catch(e){res.status(500).json({error:e.message});}
+});
+
 app.get('/api/health', (req, res) => {
   const store = readStore();
   res.json({
     ok: true,
     service: 'CRATTO CTRL',
-    model: 'CRATTO-CTRL-11.0-Poisson',
+    model: 'CRATTO-CTRL-24.0-AUTH-PORTFOLIO',
     providerConfigured: Boolean(process.env.FOOTBALL_DATA_API_KEY),
     storedMatches: store.matches.length,
     storedPredictions: store.predictions.length,
     timestamp: new Date().toISOString()
   });
+});
+
+app.get('/api/competitions', async (req, res) => {
+  try {
+    const data = await apiFetch('/competitions');
+    const competitions = (data.competitions || []).map(c => ({ id: c.id, code: c.code, name: c.name, type: c.type, plan: c.plan })).filter(c => c.code);
+    res.json({ count: competitions.length, competitions });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/matches', async (req, res) => {
@@ -200,7 +408,7 @@ app.get('/api/predictions', async (req, res) => {
     const store = readStore();
     upsertMatches(store, data.matches || []);
     const history = store.matches.filter(m => m.status === 'FINISHED');
-    const predictions = (data.matches || []).map(m => predictionForMatch(m, history));
+    const predictions = (data.matches || []).map(m => ensemblePrediction(m, history));
     for (const p of predictions) {
       const i = store.predictions.findIndex(x => x.matchId === p.matchId);
       if (i >= 0) store.predictions[i] = p; else store.predictions.push(p);
@@ -241,15 +449,16 @@ app.post('/api/strategy', async (req, res) => {
     const store = readStore(); upsertMatches(store, data.matches || []);
     const history = store.matches.filter(m => m.status === 'FINISHED');
     const selections = (data.matches || [])
-      .map(m => predictionForMatch(m, history))
-      .filter(p => p.confidence >= minConfidence && (risk === 'ALL' || p.risk === risk))
-      .sort((a, b) => b.confidence - a.confidence)
-      .slice(0, maxSelections);
+      .map(m => ensemblePrediction(m, history))
+      .filter(p => p.confidence >= minConfidence && (risk === 'ALL' || p.risk === risk));
+    const predictions = (data.matches || []).map(m => ensemblePrediction(m, history));
+    const selected = buildPortfolio(predictions, { minConfidence, maxSelections, risk });
     res.json({
       budget, stake, minConfidence, risk,
-      plannedStake: Math.min(budget, selections.length * stake),
-      remaining: Math.max(0, budget - selections.length * stake),
-      selections
+      plannedStake: Math.min(budget, selected.length * stake),
+      remaining: Math.max(0, budget - selected.length * stake),
+      selections: selected,
+      diversification: selected.length ? Number((selected.reduce((s,p)=>s+p.confidence,0)/selected.length).toFixed(3)) : 0
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -264,18 +473,79 @@ app.get('/api/backtest', (req, res) => {
     const match = sample[i];
     const history = finished.filter(x => new Date(x.utcDate) < new Date(match.utcDate)).slice(-3000);
     if (history.length < 5) continue;
-    const p = predict(match, history);
-    results.push(evaluatePrediction(p, match));
+    const p = ensemblePrediction(match, history);
+    results.push(evaluateEnsemble(p, match));
   }
   const accuracy = results.length ? results.filter(x => x.correct).length / results.length : null;
   const brier = results.length ? results.reduce((s, x) => s + x.brier, 0) / results.length : null;
+  const logLoss = results.length ? results.reduce((s,x)=>s+x.logLoss,0)/results.length : null;
   res.json({
-    model: 'CRATTO-CTRL-11.0-Poisson',
+    model: 'CRATTO-CTRL-24.0-AUTH-PORTFOLIO',
     evaluated: results.length,
     accuracy,
     brierScore: brier,
+    logLoss,
     note: 'Walk-forward evaluation on stored finished matches. Results depend on the historical data available in the service.'
   });
+});
+
+app.get('/api/model/summary', (req, res) => {
+  const store = readStore();
+  const finished = store.matches.filter(m => m.status === 'FINISHED');
+  const teams = new Set();
+  for (const m of finished) { if (m.homeTeam?.id) teams.add(m.homeTeam.id); if (m.awayTeam?.id) teams.add(m.awayTeam.id); }
+  const totalGoals = finished.reduce((s,m) => s + Number(m.score?.fullTime?.home ?? 0) + Number(m.score?.fullTime?.away ?? 0), 0);
+  res.json({
+    model: 'CRATTO-CTRL-24.0-AUTH-PORTFOLIO',
+    historicalMatches: finished.length,
+    teamsObserved: teams.size,
+    averageGoalsPerMatch: finished.length ? Number((totalGoals / finished.length).toFixed(3)) : null,
+    dataQuality: finished.length >= 500 ? 'GOOD' : finished.length >= 150 ? 'FAIR' : 'LOW',
+    limitations: ['No guarantee of future outcomes', 'No bookmaker odds/value calculation unless odds data is supplied', 'Provider permissions and historical coverage affect sample size']
+  });
+});
+
+
+app.get('/api/strengths', (req,res)=>{
+  const store=readStore(), finished=store.matches.filter(m=>m.status==='FINISHED');
+  const ratings=eloRatings(finished); const rows=[];
+  for(const [id,rating] of ratings.entries()){
+    const games=finished.filter(m=>m.homeTeam?.id===id||m.awayTeam?.id===id).slice(-12);
+    const name=(games.map(m=>m.homeTeam?.id===id?m.homeTeam.name:m.awayTeam.name).pop())||String(id);
+    rows.push({teamId:id,name,elo:Number(rating.toFixed(1)),matches:games.length});
+  }
+  rows.sort((a,b)=>b.elo-a.elo); res.json({count:rows.length,teams:rows.slice(0,100)});
+});
+
+app.get('/api/calibration', (req,res)=>{
+  const store=readStore(), finished=store.matches.filter(m=>m.status==='FINISHED').sort((a,b)=>new Date(a.utcDate)-new Date(b.utcDate));
+  const bins=Array.from({length:10},(_,i)=>({bin:i,from:i/10,to:(i+1)/10,count:0,correct:0,observed:null}));
+  for(let i=0;i<finished.length;i++){
+    const m=finished[i], hist=finished.slice(0,i); if(hist.length<5) continue;
+    const p=ensemblePrediction(m,hist), arr=[p.probabilities.homeWin,p.probabilities.draw,p.probabilities.awayWin], prob=Math.max(...arr);
+    const actual=m.score.fullTime.home>m.score.fullTime.away?0:m.score.fullTime.home===m.score.fullTime.away?1:2;
+    const b=Math.min(9,Math.floor(prob*10)); bins[b].count++; bins[b].correct += arr.indexOf(prob)===actual?1:0;
+  }
+  for(const b of bins) if(b.count) b.observed=Number((b.correct/b.count).toFixed(4));
+  res.json({bins, note:'Calibration compares predicted top-class probability with observed correctness in walk-forward bins.'});
+});
+
+app.get('/api/portfolio', async (req,res)=>{
+  try{
+    const now=new Date(), q=new URLSearchParams({dateFrom:now.toISOString().slice(0,10),dateTo:new Date(now.getTime()+7*86400000).toISOString().slice(0,10),status:'SCHEDULED'});
+    if(req.query.competitions) q.set('competitions',req.query.competitions);
+    const data=await apiFetch('/matches?'+q.toString()); const store=readStore(); upsertMatches(store,data.matches||[]);
+    const history=store.matches.filter(m=>m.status==='FINISHED'); const predictions=(data.matches||[]).map(m=>ensemblePrediction(m,history));
+    const selections=buildPortfolio(predictions,{minConfidence:req.query.minConfidence||.60,maxSelections:req.query.maxSelections||6,risk:req.query.risk||'ALL'});
+    res.json({selections, count:selections.length, model:'CRATTO-CTRL-24.0-AUTH-PORTFOLIO'});
+  }catch(e){res.status(500).json({error:e.message});}
+});
+
+app.get('/api/model/diagnostics',(req,res)=>{
+  const store=readStore(), finished=store.matches.filter(m=>m.status==='FINISHED').sort((a,b)=>new Date(a.utcDate)-new Date(b.utcDate));
+  const recent=finished.slice(-100), prior=finished.slice(-200,-100);
+  const score=(set)=>{ if(!set.length) return null; let c=0; for(let i=0;i<set.length;i++){const hist=finished.filter(x=>new Date(x.utcDate)<new Date(set[i].utcDate));if(hist.length<5)continue;const p=ensemblePrediction(set[i],hist);const a=set[i].score.fullTime.home>set[i].score.fullTime.away?0:set[i].score.fullTime.home===set[i].score.fullTime.away?1:2;const arr=[p.probabilities.homeWin,p.probabilities.draw,p.probabilities.awayWin];if(arr.indexOf(Math.max(...arr))===a)c++;} return c/set.length;};
+  const r=score(recent), p=score(prior); res.json({recentAccuracy:r,priorAccuracy:p,drift:r!=null&&p!=null?Number((r-p).toFixed(4)):null,status:r!=null&&p!=null&&r<p-.12?'REVIEW':'STABLE',sampleRecent:recent.length,samplePrior:prior.length});
 });
 
 app.get('/api/analytics', (req, res) => {
@@ -285,14 +555,22 @@ app.get('/api/analytics', (req, res) => {
     matches: store.matches.length,
     predictions: store.predictions.length,
     finished,
-    model: 'CRATTO-CTRL-11.0-Poisson',
+    model: 'CRATTO-CTRL-24.0-AUTH-PORTFOLIO',
     dataQuality: finished >= 300 ? 'GOOD' : finished >= 100 ? 'FAIR' : 'LOW',
     lastProviderSync: store.meta?.lastProviderSync || null,
     lastHistoricalSync: store.meta?.lastHistoricalSync || null
   });
 });
 
+app.get('/api/admin/summary',async(req,res)=>{
+  const key=String(req.headers['x-admin-key']||'');
+  if(!process.env.ADMIN_KEY || key!==process.env.ADMIN_KEY) return res.status(403).json({error:'Admin access denied.'});
+  const stats=dbEnabled ? await adminStats() : (()=>{const s=readStore();return {users:s.users.length,slips:s.slips.length};})();
+  const store=readStore();
+  res.json({database:dbEnabled,users:stats.users,slips:stats.slips,matches:store.matches.length,predictions:store.predictions.length,lastProviderSync:store.meta.lastProviderSync||null,lastHistoricalSync:store.meta.lastHistoricalSync||null});
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 app.use((req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
-app.listen(PORT, HOST, () => console.log(`CRATTO CTRL listening on http://${HOST}:${PORT}`));
+initDb().then(() => app.listen(PORT, HOST, () => console.log(`CRATTO CTRL listening on http://${HOST}:${PORT} | database=${dbEnabled}`))).catch(err => { console.error('Database initialization failed:', err); process.exit(1); });
