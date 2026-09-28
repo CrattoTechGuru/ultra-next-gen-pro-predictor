@@ -1,1 +1,0 @@
-{"name":"ultra-next-gen-pro-predictor","version":"10.0.0","private":true,"type":"module","scripts":{"start":"node server.js"},"dependencies":{"dotenv":"^17.2.2","express":"^5.1.0"}}
