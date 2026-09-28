@@ -1,26 +1,34 @@
-# Ultra Next Gen Pro Predictor 10.0
+# Ultra Next Gen Pro Predictor — CRATTO CTRL 11.0
 
-Production-oriented football prediction platform foundation.
+A Node.js/Express football analytics application using football-data.org v4 as a server-side data provider.
 
-## 10.0 additions
-- Cloud-ready data model
-- Model Lab calibration endpoint
-- System health endpoint
-- Versioned prediction engine
-- Walk-forward evaluation architecture
-- Poisson + Elo-style + recent-form ensemble
-- Strategy engine with budget controls
-- Modular provider architecture for future odds/xG/lineups/statistics
+## Features
+- Upcoming fixture retrieval
+- Poisson-based probability model
+- Venue-specific recent form
+- Home/draw/away, over 2.5 and BTTS probabilities
+- Confidence and risk bands
+- Rules-based strategy generator
+- Historical data sync
+- Walk-forward backtesting with accuracy and Brier score
+- CRATTO CTRL dashboard
 
-## Run
-1. Install Node.js 20+.
-2. Copy `.env.example` to `.env`.
-3. Add your football-data.org API token.
-4. Run `npm install`.
-5. Run `npm start`.
-6. Open `http://localhost:3000`.
+## Run locally
+```bash
+npm install
+cp .env.example .env
+# Put your football-data.org token in .env
+npm start
+```
 
-Provider reference: https://www.football-data.org/documentation/quickstart
-Attribution required by provider: Data provided by football-data.org.
+Open `http://localhost:10000`.
 
-This system does not guarantee any accuracy percentage. Performance must be established from historical evaluation.
+## Render
+- Build Command: `npm install`
+- Start Command: `npm start`
+- Environment variable: `FOOTBALL_DATA_API_KEY`
+
+The server binds to `0.0.0.0` and uses Render's `PORT` variable.
+
+## Important
+Predictions are statistical estimates. Backtest results are not guarantees of future accuracy, profit, or returns.
