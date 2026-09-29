@@ -77,3 +77,25 @@ V50 is the consolidated CRATTO CTRL platform build. It combines the existing aut
 
 ### V50 release scope
 The objective of V50 is feature consolidation. After this build, development can focus on release testing, deployment verification, security review, data-provider configuration, monitoring, documentation, and user acceptance rather than adding another versioned feature layer.
+
+## Final data-engine release
+
+The production data layer now:
+- discovers competitions from the football-data.org `/competitions` catalogue;
+- syncs upcoming fixtures across the discovered competition set;
+- splits upcoming date ranges into sub-10-day windows to avoid provider period errors;
+- loads current-season competition match history for form, Elo and walk-forward evaluation;
+- rate-limits provider requests and reacts to provider reset/429 headers;
+- persists the provider dataset through the existing application state/PostgreSQL layer;
+- rebuilds predictions from stored fixtures instead of a hard-coded team list;
+- exposes competition coverage, sync statistics and sync errors in Operations;
+- keeps the product identity as **Ultra Next Gen Pro Predictor**; **CRATTO CTRL** remains the footer brand only;
+- includes the required football-data.org attribution in the application footer.
+
+Recommended Render variables in addition to the existing production variables:
+- `SYNC_INTERVAL_MINUTES=30`
+- `HISTORY_DAYS=9`
+- `UPCOMING_DAYS=9`
+- `FOOTBALL_DATA_MIN_REQUEST_MS=6500`
+
+The exact competitions and historical depth available still depend on the football-data.org plan attached to the API key. The provider documents `/competitions` as the entry point to available competitions and recommends smart requests/throttling. See the official API documentation: https://www.football-data.org/documentation/api

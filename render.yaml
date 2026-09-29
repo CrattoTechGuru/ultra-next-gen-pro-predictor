@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: ultra-next-gen-pro-predictor
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SYNC_INTERVAL_MINUTES
+        value: '30'
+      - key: HISTORY_DAYS
+        value: '9'
+      - key: UPCOMING_DAYS
+        value: '9'
+      - key: LIVE_POLL_SECONDS
+        value: '90'
+      - key: FOOTBALL_DATA_MIN_REQUEST_MS
+        value: '6500'
+      - key: FOOTBALL_DATA_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_SSL
+        value: 'true'
+      - key: ADMIN_KEY
+        sync: false
