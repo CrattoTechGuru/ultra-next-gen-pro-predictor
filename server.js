@@ -43,6 +43,73 @@ async function apiFootball(path, params = {}) {
 
   return response.json();
 }
+
+dotenv.config();
+
+const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY;
+const API_FOOTBALL_BASE = 'https://v3.football.api-sports.io';
+
+async function apiFootball(path, params = {}) {
+  if (!API_FOOTBALL_KEY) {
+    throw new Error('API_FOOTBALL_KEY is not configured');
+  }
+
+  const url = new URL(`${API_FOOTBALL_BASE}${path}`);
+
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== '') {
+      url.searchParams.set(key, value);
+    }
+  }
+
+  const response = await fetch(url, {
+    headers: {
+      'x-apisports-key': API_FOOTBALL_KEY
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `API-Football returned HTTP ${response.status}: ${await response.text()}`
+    );
+  }
+
+  return response.json();
+}
+
+function generateSlipCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+  let value = '';
+
+  for (let i = 0; i < 8; i++) {
+    value += chars[
+      crypto.randomInt(0, chars.length)
+    ];
+  }
+
+  return `UHP-${value}`;
+}
+
+function buildCopyableSlip(slip) {
+  return [
+    `ULTRA NEXT GEN PRO PREDICTOR`,
+    `SLIP: ${slip.code}`,
+    '',
+    ...slip.selections.map(
+      (selection, index) =>
+        `${index + 1}. ${selection.home} vs ${selection.away} — ${selection.marketLabel}`
+    ),
+    '',
+    `Selections: ${slip.selectionCount}`,
+    `Risk: ${slip.risk}`,
+    `Model confidence: ${slip.averageConfidence}%`,
+    '',
+    'MODEL-GENERATED SELECTIONS — NO GUARANTEE OF RESULT'
+  ].join('\n');
+}
+
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.use(express.json({ limit: '1mb' }));
