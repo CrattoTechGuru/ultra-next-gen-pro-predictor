@@ -1,17 +1,16 @@
 {
-  "name": "ultra-next-gen-pro-predictor",
-  "version": "50.0.0",
+  "name": "v1000-additive-upgrade",
+  "version": "1.0.0",
   "private": true,
-  "type": "module",
+  "description": "Additive upgrade for Ultra Next Gen Pro Predictor; preserves the existing UI and keeps Auto Slip separate.",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=18"
   },
   "dependencies": {
-    "dotenv": "^17.2.2",
-    "express": "^5.1.0",
-    "pg": "^8.16.3"
+    "express": "^4.21.2"
   }
 }
