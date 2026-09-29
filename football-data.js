@@ -1,0 +1,6 @@
+const BASE='https://api.football-data.org/v4';
+async function req(path,key){if(!key) throw new Error('FOOTBALL_DATA_API_KEY is not configured');const r=await fetch(BASE+path,{headers:{'X-Auth-Token':key}});const body=await r.text();if(!r.ok)throw new Error(`football-data.org returned HTTP ${r.status}: ${body}`);return JSON.parse(body)}
+export async function competitions(key){return (await req('/competitions/',key)).competitions||[]}
+export async function matches(key,{from,to,competition}={}){let p=new URLSearchParams();if(from)p.set('dateFrom',from);if(to)p.set('dateTo',to);if(competition)p.set('competitions',competition);return (await req('/matches?'+p.toString(),key)).matches||[]}
+export async function teamMatches(key,teamId,{from,to,status='FINISHED',limit=10}={}){let p=new URLSearchParams({status,limit:String(limit)});if(from)p.set('dateFrom',from);if(to)p.set('dateTo',to);return (await req(`/teams/${teamId}/matches?${p}`,key)).matches||[]}
+export const normalize=m=>({provider:'football-data.org',providerFixtureId:m.id,utcDate:m.utcDate,status:m.status,homeTeam:{id:`fd-team-${m.homeTeam?.id}`,name:m.homeTeam?.name||'Home'},awayTeam:{id:`fd-team-${m.awayTeam?.id}`,name:m.awayTeam?.name||'Away'},competition:{id:m.competition?.id,name:m.competition?.name,area:m.area?.name},score:m.score});
