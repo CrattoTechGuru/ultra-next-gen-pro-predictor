@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
-import { dbEnabled, initDb, getUserByEmail, getUserById, createUser, createSession, getSession, deleteSession, listUserSlips, createSlip, getSlipByCode, adminStats, createJob, finishJob, recentJobs, upsertModel, listModels, addNotification, listNotifications, markNotificationRead, audit, usage, saveOdds, listOdds, saveEvaluation, evaluationSummary, createAlert, listAlerts } from './db.js';
+import { dbEnabled, initDb, loadAppState, saveAppState, getUserByEmail, getUserById, createUser, createSession, getSession, deleteSession, listUserSlips, createSlip, getSlipByCode, adminStats, createJob, finishJob, recentJobs, upsertModel, listModels, addNotification, listNotifications, markNotificationRead, audit, usage, saveOdds, listOdds, saveEvaluation, evaluationSummary, createAlert, listAlerts } from './db.js';
 import { startScheduler, makeJobId } from './operations.js';
 import { impliedProbability, valueMetrics, marketProbability, rankValue } from './intelligence.js';
 import { makeRunId } from './automation.js';
@@ -22,8 +22,11 @@ const PORT = Number(process.env.PORT) || 10000;
 const HOST = '0.0.0.0';
 const API = 'https://api.football-data.org/v4';
 const storePath = path.join(__dirname, 'data', 'store.json');
+let runtimeStore = null;
+let stateWriteTimer = null;
 
 function readStore() {
+  if (runtimeStore) return runtimeStore;
   try {
     const s = JSON.parse(fs.readFileSync(storePath, 'utf8'));
     s.matches ??= []; s.predictions ??= []; s.evaluations ??= []; s.meta ??= {};
@@ -32,10 +35,16 @@ function readStore() {
   } catch { return { matches: [], predictions: [], evaluations: [], meta: {}, users: [], sessions: [], slips: [] }; }
 }
 function writeStore(store) {
+  runtimeStore = store;
   store.users ??= []; store.sessions ??= []; store.slips ??= [];
   fs.mkdirSync(path.dirname(storePath), { recursive: true });
   fs.writeFileSync(storePath, JSON.stringify(store, null, 2));
+  if (dbEnabled) {
+    clearTimeout(stateWriteTimer);
+    stateWriteTimer = setTimeout(() => saveAppState('runtime_store', store).catch(err => console.error('State persistence failed:', err.message)), 250);
+  }
 }
+
 function clamp(x, min = 0, max = 1) { return Math.max(min, Math.min(max, x)); }
 function factorial(n) { let r = 1; for (let i = 2; i <= n; i++) r *= i; return r; }
 function poisson(k, lambda) { return Math.exp(-lambda) * Math.pow(lambda, k) / factorial(k); }
@@ -433,7 +442,8 @@ app.get('/api/health', (req, res) => {
   const store = readStore();
   res.json({
     ok: true,
-    service: 'CRATTO CTRL',
+    service: 'Ultra Next Gen Pro Predictor',
+    brand: 'CRATTO CTRL',
     model: 'CRATTO-CTRL-30.0-INTELLIGENCE-CORE',
     providerConfigured: Boolean(process.env.FOOTBALL_DATA_API_KEY),
     storedMatches: store.matches.length,
@@ -465,6 +475,31 @@ app.get('/api/matches', async (req, res) => {
     writeStore(store);
     res.json({ count: data.matches?.length || 0, matches: data.matches || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/data/status', requireAuth, (req,res)=>{
+  const store=readStore();
+  res.json({matches:store.matches.length,predictions:store.predictions.length,finished:store.matches.filter(m=>m.status==='FINISHED').length,scheduled:store.matches.filter(m=>['SCHEDULED','TIMED','POSTPONED'].includes(m.status)).length,teams:[...new Set(store.matches.flatMap(m=>[m.homeTeam?.name,m.awayTeam?.name].filter(Boolean)))].length,lastProviderSync:store.meta.lastProviderSync||null,lastHistoricalSync:store.meta.lastHistoricalSync||null});
+});
+
+app.post('/api/data/refresh', requireAuth, async (req,res)=>{
+  try {
+    const now=new Date();
+    const from=new Date(now.getTime()-60*86400000).toISOString().slice(0,10);
+    const to=new Date(now.getTime()+14*86400000).toISOString().slice(0,10);
+    const q=new URLSearchParams({dateFrom:from,dateTo:to});
+    if(req.body?.competitions) q.set('competitions',String(req.body.competitions));
+    const data=await apiFetch('/matches?'+q.toString());
+    const store=readStore(); upsertMatches(store,data.matches||[]);
+    store.meta.lastProviderSync=new Date().toISOString();
+    store.meta.lastHistoricalSync=new Date().toISOString();
+    const history=store.matches.filter(m=>m.status==='FINISHED');
+    const upcoming=store.matches.filter(m=>['SCHEDULED','TIMED'].includes(m.status));
+    const predictions=upcoming.map(m=>ensemblePrediction(m,history));
+    for(const p of predictions){const i=store.predictions.findIndex(x=>x.matchId===p.matchId); if(i>=0) store.predictions[i]=p; else store.predictions.push(p);}
+    writeStore(store);
+    res.json({ok:true,synced:data.matches?.length||0,finished:history.length,upcoming:upcoming.length,predictions:predictions.length,teams:[...new Set(upcoming.flatMap(m=>[m.homeTeam?.name,m.awayTeam?.name].filter(Boolean)))].length,from,to});
+  } catch(e){res.status(500).json({error:e.message});}
 });
 
 app.get('/api/predictions', async (req, res) => {
@@ -854,8 +889,25 @@ app.use((req,res,next)=>{ if(req.path.startsWith('/api/')) return next(); res.se
 let scheduler = null;
 initDb().then(async () => {
   if (dbEnabled) {
+    const persisted = await loadAppState('runtime_store').catch(()=>null);
+    if (persisted && typeof persisted === 'object') runtimeStore = persisted;
     await upsertModel({version:'CRATTO-CTRL-30.0-INTELLIGENCE-CORE',name:'Intelligence + value ensemble',status:'ACTIVE',metrics:{family:'poisson+elo+form'}});
   }
   scheduler = startScheduler({syncProvider:scheduledSync, refreshPredictions:scheduledPredictions, intervalMinutes:Number(process.env.SYNC_INTERVAL_MINUTES||30)});
-  app.listen(PORT, HOST, () => console.log(`CRATTO CTRL v30 listening on http://${HOST}:${PORT} | database=${dbEnabled} | scheduler=${scheduler.intervalMinutes}m`));
+  // Populate a meaningful initial dataset on a fresh deployment. One provider request is used for a broad window.
+  try {
+    const store=readStore();
+    if (!store.meta.initialDataBootstrapAt || store.matches.length < 20) {
+      const now=new Date(), from=new Date(now.getTime()-60*86400000).toISOString().slice(0,10), to=new Date(now.getTime()+14*86400000).toISOString().slice(0,10);
+      const q=new URLSearchParams({dateFrom:from,dateTo:to});
+      const data=await apiFetch('/matches?'+q.toString());
+      upsertMatches(store,data.matches||[]); store.meta.initialDataBootstrapAt=new Date().toISOString(); store.meta.lastProviderSync=new Date().toISOString(); store.meta.lastHistoricalSync=new Date().toISOString();
+      const history=store.matches.filter(m=>m.status==='FINISHED');
+      const upcoming=store.matches.filter(m=>['SCHEDULED','TIMED'].includes(m.status));
+      for(const m of upcoming){const pred=ensemblePrediction(m,history); const i=store.predictions.findIndex(x=>x.matchId===pred.matchId); if(i>=0) store.predictions[i]=pred; else store.predictions.push(pred);}
+      writeStore(store);
+      console.log(`Initial football dataset loaded: ${store.matches.length} matches, ${history.length} finished, ${upcoming.length} upcoming.`);
+    }
+  } catch(e) { console.error('Initial football data bootstrap skipped:', e.message); }
+  app.listen(PORT, HOST, () => console.log(`Ultra Next Gen Pro Predictor listening on http://${HOST}:${PORT} | database=${dbEnabled} | scheduler=${scheduler.intervalMinutes}m`));
 }).catch(err => { console.error('Database initialization failed:', err); process.exit(1); });

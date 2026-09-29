@@ -6,7 +6,8 @@ export const dbEnabled = Boolean(url);
 export const pool = dbEnabled ? new Pool({ connectionString: url, ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false }, max: 5 }) : null;
 export async function initDb(){
   if(!pool) return {enabled:false};
-  await pool.query(`CREATE TABLE IF NOT EXISTS cctrl_users (
+  await pool.query(`CREATE TABLE IF NOT EXISTS cctrl_app_state (key TEXT PRIMARY KEY, value JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+  CREATE TABLE IF NOT EXISTS cctrl_users (
     id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
   CREATE TABLE IF NOT EXISTS cctrl_sessions (
@@ -62,3 +63,6 @@ export async function saveEvaluation(e){ if(!pool) return e; const r=await pool.
 export async function evaluationSummary(modelVersion){ if(!pool) return null; const r=await pool.query('SELECT COUNT(*)::int AS n, AVG(correct::int)::float AS accuracy, AVG(brier)::float AS brier, AVG(log_loss)::float AS log_loss FROM cctrl_prediction_evaluations WHERE model_version=$1',[modelVersion]); return r.rows[0]; }
 export async function createAlert(a){ if(!pool) return a; const r=await pool.query('INSERT INTO cctrl_alerts(id,user_id,type,payload) VALUES($1,$2,$3,$4::jsonb) RETURNING *',[a.id,a.userId,a.type,JSON.stringify(a.payload||{})]); return r.rows[0]; }
 export async function listAlerts(userId){ if(!pool) return []; const r=await pool.query('SELECT id,type,payload,delivered_at AS "deliveredAt",created_at AS "createdAt" FROM cctrl_alerts WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100',[userId]); return r.rows; }
+
+export async function loadAppState(key){ if(!pool) return null; const r=await pool.query('SELECT value FROM cctrl_app_state WHERE key=$1',[key]); return r.rows[0]?.value ?? null; }
+export async function saveAppState(key,value){ if(!pool) return; await pool.query('INSERT INTO cctrl_app_state(key,value,updated_at) VALUES($1,$2::jsonb,NOW()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=NOW()',[key,JSON.stringify(value)]); }
