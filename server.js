@@ -13,6 +13,36 @@ import { ensembleModels, walkForward, calibration as advancedCalibration, league
 import { summarizeStore, coverage } from './data_engine.js';
 
 dotenv.config();
+const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY;
+const API_FOOTBALL_BASE = 'https://v3.football.api-sports.io';
+
+async function apiFootball(path, params = {}) {
+  if (!API_FOOTBALL_KEY) {
+    throw new Error('API_FOOTBALL_KEY is not configured');
+  }
+
+  const url = new URL(`${API_FOOTBALL_BASE}${path}`);
+
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== '') {
+      url.searchParams.set(key, value);
+    }
+  }
+
+  const response = await fetch(url, {
+    headers: {
+      'x-apisports-key': API_FOOTBALL_KEY
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `API-Football returned HTTP ${response.status}: ${await response.text()}`
+    );
+  }
+
+  return response.json();
+}
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.use(express.json({ limit: '1mb' }));
