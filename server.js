@@ -62,6 +62,41 @@ async function apiFetch(endpoint) {
   return response.json();
 }
 
+// football-data.org rejects date ranges longer than 10 days (HTTP 400), so long windows
+// are fetched in consecutive chunks. Chunks are paced for the provider's per-minute rate
+// limit (free plan: about 10 requests/min); set FOOTBALL_DATA_CHUNK_PAUSE_MS=0 on a plan
+// with a higher limit.
+const MAX_RANGE_DAYS = 10;
+const MAX_RANGE_CHUNKS = 12;
+const CHUNK_PAUSE_MS = Number(process.env.FOOTBALL_DATA_CHUNK_PAUSE_MS || 6500);
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function apiFetchMatchesRange(dateFrom, dateTo, extra = {}) {
+  const DAY = 86400000;
+  const start = new Date(String(dateFrom).slice(0, 10) + 'T00:00:00Z');
+  const end = new Date(String(dateTo).slice(0, 10) + 'T00:00:00Z');
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) {
+    throw new Error('Invalid date range: use YYYY-MM-DD dates, with the start on or before the end.');
+  }
+  const chunks = Math.ceil(((end - start) / DAY + 1) / MAX_RANGE_DAYS);
+  if (chunks > MAX_RANGE_CHUNKS) {
+    throw new Error(`Date range too long: ${MAX_RANGE_CHUNKS * MAX_RANGE_DAYS} days maximum.`);
+  }
+  const matches = [];
+  for (let i = 0, cursor = start.getTime(); cursor <= end.getTime(); i++, cursor += MAX_RANGE_DAYS * DAY) {
+    const chunkEnd = Math.min(cursor + (MAX_RANGE_DAYS - 1) * DAY, end.getTime());
+    const q = new URLSearchParams({
+      dateFrom: new Date(cursor).toISOString().slice(0, 10),
+      dateTo: new Date(chunkEnd).toISOString().slice(0, 10),
+      ...extra
+    });
+    if (i > 0 && CHUNK_PAUSE_MS > 0) await sleep(CHUNK_PAUSE_MS);
+    const data = await apiFetch('/matches?' + q.toString());
+    matches.push(...(data.matches || []));
+  }
+  return { matches };
+}
+
 function upsertMatches(store, matches = []) {
   for (const match of matches) {
     const i = store.matches.findIndex(x => x.id === match.id);
@@ -465,10 +500,10 @@ app.get('/api/matches', async (req, res) => {
     const now = new Date();
     const from = req.query.dateFrom || now.toISOString().slice(0, 10);
     const to = req.query.dateTo || new Date(now.getTime() + 7 * 86400000).toISOString().slice(0, 10);
-    const q = new URLSearchParams({ dateFrom: from, dateTo: to });
-    if (req.query.competitions) q.set('competitions', req.query.competitions);
-    if (req.query.status) q.set('status', req.query.status);
-    const data = await apiFetch('/matches?' + q.toString());
+    const extra = {};
+    if (req.query.competitions) extra.competitions = String(req.query.competitions);
+    if (req.query.status) extra.status = String(req.query.status);
+    const data = await apiFetchMatchesRange(from, to, extra);
     const store = readStore();
     upsertMatches(store, data.matches || []);
     store.meta.lastProviderSync = new Date().toISOString();
@@ -487,9 +522,8 @@ app.post('/api/data/refresh', requireAuth, async (req,res)=>{
     const now=new Date();
     const from=new Date(now.getTime()-60*86400000).toISOString().slice(0,10);
     const to=new Date(now.getTime()+14*86400000).toISOString().slice(0,10);
-    const q=new URLSearchParams({dateFrom:from,dateTo:to});
-    if(req.body?.competitions) q.set('competitions',String(req.body.competitions));
-    const data=await apiFetch('/matches?'+q.toString());
+    const extra={}; if(req.body?.competitions) extra.competitions=String(req.body.competitions);
+    const data=await apiFetchMatchesRange(from,to,extra);
     const store=readStore(); upsertMatches(store,data.matches||[]);
     store.meta.lastProviderSync=new Date().toISOString();
     store.meta.lastHistoricalSync=new Date().toISOString();
@@ -507,9 +541,9 @@ app.get('/api/predictions', async (req, res) => {
     const now = new Date();
     const from = req.query.dateFrom || now.toISOString().slice(0, 10);
     const to = req.query.dateTo || new Date(now.getTime() + 7 * 86400000).toISOString().slice(0, 10);
-    const q = new URLSearchParams({ dateFrom: from, dateTo: to, status: 'SCHEDULED' });
-    if (req.query.competitions) q.set('competitions', req.query.competitions);
-    const data = await apiFetch('/matches?' + q.toString());
+    const extra = { status: 'SCHEDULED' };
+    if (req.query.competitions) extra.competitions = String(req.query.competitions);
+    const data = await apiFetchMatchesRange(from, to, extra);
     const store = readStore();
     upsertMatches(store, data.matches || []);
     const history = store.matches.filter(m => m.status === 'FINISHED');
@@ -527,9 +561,9 @@ app.get('/api/predictions', async (req, res) => {
 app.post('/api/sync', async (req, res) => {
   try {
     if (!req.body.from || !req.body.to) return res.status(400).json({ error: 'from and to dates are required' });
-    const q = new URLSearchParams({ dateFrom: req.body.from, dateTo: req.body.to, status: 'FINISHED' });
-    if (req.body.competitions) q.set('competitions', req.body.competitions);
-    const data = await apiFetch('/matches?' + q.toString());
+    const extra = { status: 'FINISHED' };
+    if (req.body.competitions) extra.competitions = String(req.body.competitions);
+    const data = await apiFetchMatchesRange(req.body.from, req.body.to, extra);
     const store = readStore(); upsertMatches(store, data.matches || []);
     store.meta.lastHistoricalSync = new Date().toISOString(); writeStore(store);
     res.json({ synced: data.matches?.length || 0 });
@@ -894,13 +928,15 @@ initDb().then(async () => {
     await upsertModel({version:'CRATTO-CTRL-30.0-INTELLIGENCE-CORE',name:'Intelligence + value ensemble',status:'ACTIVE',metrics:{family:'poisson+elo+form'}});
   }
   scheduler = startScheduler({syncProvider:scheduledSync, refreshPredictions:scheduledPredictions, intervalMinutes:Number(process.env.SYNC_INTERVAL_MINUTES||30)});
-  // Populate a meaningful initial dataset on a fresh deployment. One provider request is used for a broad window.
+  // Start listening first: the initial data load below is paced for the provider's rate limit and takes about a minute.
+  app.listen(PORT, HOST, () => console.log(`Ultra Next Gen Pro Predictor listening on http://${HOST}:${PORT} | database=${dbEnabled} | scheduler=${scheduler.intervalMinutes}m`));
+  // Populate a meaningful initial dataset on a fresh deployment (fetched in chunks of at most 10 days).
   try {
-    const store=readStore();
-    if (!store.meta.initialDataBootstrapAt || store.matches.length < 20) {
+    const initial=readStore();
+    if (!initial.meta.initialDataBootstrapAt || initial.matches.length < 20) {
       const now=new Date(), from=new Date(now.getTime()-60*86400000).toISOString().slice(0,10), to=new Date(now.getTime()+14*86400000).toISOString().slice(0,10);
-      const q=new URLSearchParams({dateFrom:from,dateTo:to});
-      const data=await apiFetch('/matches?'+q.toString());
+      const data=await apiFetchMatchesRange(from,to);
+      const store=readStore(); // re-read after the slow fetch so newer writes are not overwritten
       upsertMatches(store,data.matches||[]); store.meta.initialDataBootstrapAt=new Date().toISOString(); store.meta.lastProviderSync=new Date().toISOString(); store.meta.lastHistoricalSync=new Date().toISOString();
       const history=store.matches.filter(m=>m.status==='FINISHED');
       const upcoming=store.matches.filter(m=>['SCHEDULED','TIMED'].includes(m.status));
@@ -909,5 +945,4 @@ initDb().then(async () => {
       console.log(`Initial football dataset loaded: ${store.matches.length} matches, ${history.length} finished, ${upcoming.length} upcoming.`);
     }
   } catch(e) { console.error('Initial football data bootstrap skipped:', e.message); }
-  app.listen(PORT, HOST, () => console.log(`Ultra Next Gen Pro Predictor listening on http://${HOST}:${PORT} | database=${dbEnabled} | scheduler=${scheduler.intervalMinutes}m`));
 }).catch(err => { console.error('Database initialization failed:', err); process.exit(1); });
