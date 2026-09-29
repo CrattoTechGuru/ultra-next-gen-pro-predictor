@@ -1149,5 +1149,9 @@ function normalizeApiFootballFixture(
     },
 
     awayTeam: {
-      id:
-        `apifb-team-${tea
+  id:
+    `apifb-team-${teams.away.id}`,
+  name:
+    teams.away.name ||
+    'Away'
+},
