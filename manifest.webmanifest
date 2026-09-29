@@ -1,0 +1,10 @@
+{
+  "name": "CRATTO CTRL — Intelligence Analytics Control",
+  "short_name": "CRATTO CTRL",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#070b14",
+  "theme_color": "#070b14",
+  "description": "Football prediction, analytics, strategy and portfolio intelligence platform.",
+  "icons": []
+}
