@@ -1,0 +1,460 @@
+import express from 'express';
+import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import { fileURLToPath } from 'url';
+import { dbEnabled, initDb, loadAppState, saveAppState, getUserByEmail, getUserById, createUser, createSession, getSession, deleteSession, listUserSlips, createSlip, getSlipByCode, adminStats, createJob, finishJob, recentJobs, upsertModel, listModels, addNotification, listNotifications, markNotificationRead, audit, usage, saveOdds, listOdds, saveEvaluation, evaluationSummary, createAlert, listAlerts } from './db.js';
+import { startScheduler, makeJobId } from './operations.js';
+import { impliedProbability, valueMetrics, marketProbability, rankValue } from './intelligence.js';
+import { makeRunId } from './automation.js';
+import { rateLimit, safeCompare } from './security.js';
+import { ensembleModels, walkForward, calibration as advancedCalibration, leaguePerformance } from './advanced_models.js';
+import { summarizeStore, coverage } from './data_engine.js';
+
+dotenv.config();
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+app.use('/api/', rateLimit({ windowMs: 60_000, max: 180 }));
+
+const PORT = Number(process.env.PORT) || 10000;
+const HOST = '0.0.0.0';
+const API = 'https://api.football-data.org/v4';
+const storePath = path.join(__dirname, 'data', 'store.json');
+let runtimeStore = null;
+let stateWriteTimer = null;
+
+function readStore() {
+  if (runtimeStore) return runtimeStore;
+  try {
+    const s = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+    s.matches ??= []; s.predictions ??= []; s.evaluations ??= []; s.meta ??= {};
+    s.users ??= []; s.sessions ??= []; s.slips ??= [];
+    return s;
+  } catch { return { matches: [], predictions: [], evaluations: [], meta: {}, users: [], sessions: [], slips: [] }; }
+}
+function writeStore(store) {
+  runtimeStore = store;
+  store.users ??= []; store.sessions ??= []; store.slips ??= [];
+  fs.mkdirSync(path.dirname(storePath), { recursive: true });
+  fs.writeFileSync(storePath, JSON.stringify(store, null, 2));
+  if (dbEnabled) {
+    clearTimeout(stateWriteTimer);
+    stateWriteTimer = setTimeout(() => saveAppState('runtime_store', store).catch(err => console.error('State persistence failed:', err.message)), 250);
+  }
+}
+
+function clamp(x, min = 0, max = 1) { return Math.max(min, Math.min(max, x)); }
+function factorial(n) { let r = 1; for (let i = 2; i <= n; i++) r *= i; return r; }
+function poisson(k, lambda) { return Math.exp(-lambda) * Math.pow(lambda, k) / factorial(k); }
+
+const API_RATE_SAFE_MS = Number(process.env.FOOTBALL_DATA_MIN_REQUEST_MS || 6500);
+let lastProviderRequestAt = 0;
+let providerPause = Promise.resolve();
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+async function waitForProviderSlot() {
+  providerPause = providerPause.then(async () => {
+    const elapsed = Date.now() - lastProviderRequestAt;
+    if (elapsed < API_RATE_SAFE_MS) await sleep(API_RATE_SAFE_MS - elapsed);
+    lastProviderRequestAt = Date.now();
+  });
+  return providerPause;
+}
+
+async function apiFetch(endpoint, attempt = 0) {
+  const token = process.env.FOOTBALL_DATA_API_KEY;
+  if (!token) throw new Error('FOOTBALL_DATA_API_KEY is not configured on Render.');
+  await waitForProviderSlot();
+  const response = await fetch(API + endpoint, {
+    headers: { 'X-Auth-Token': token, 'Accept': 'application/json' }
+  });
+  const reset = Number(response.headers.get('X-RequestCounter-Reset') || 0);
+  const remaining = Number(response.headers.get('X-Requests-Available-Minute') || -1);
+  if (response.status === 429) {
+    if (attempt >= 2) throw new Error('football-data.org rate limit reached. Try again after the provider counter resets.');
+    await sleep(Math.max(5000, (reset + 2) * 1000));
+    return apiFetch(endpoint, attempt + 1);
+  }
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`football-data.org returned HTTP ${response.status}: ${body.slice(0, 500)}`);
+  }
+  const data = await response.json();
+  return { ...data, __provider: { remaining, reset } };
+}
+
+function isoDate(d) { return new Date(d).toISOString().slice(0, 10); }
+function dateChunks(from, to, maxDays = 9) {
+  const out = [];
+  let cursor = new Date(`${from}T00:00:00Z`);
+  const end = new Date(`${to}T00:00:00Z`);
+  while (cursor <= end) {
+    const chunkStart = new Date(cursor);
+    const chunkEnd = new Date(cursor);
+    chunkEnd.setUTCDate(chunkEnd.getUTCDate() + maxDays - 1);
+    if (chunkEnd > end) chunkEnd.setTime(end.getTime());
+    out.push({ from: isoDate(chunkStart), to: isoDate(chunkEnd) });
+    cursor = new Date(chunkEnd);
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return out;
+}
+
+async function discoverCompetitions() {
+  const data = await apiFetch('/competitions');
+  return (data.competitions || [])
+    .filter(c => c && c.code)
+    .map(c => ({
+      id: c.id, code: c.code, name: c.name, type: c.type, plan: c.plan || null,
+      area: c.area?.name || null, currentSeason: c.currentSeason || null
+    }));
+}
+
+async function syncLiveMatches() {
+  const store = readStore();
+  const competitions = (store.meta.providerCompetitions || []).filter(c => c.code);
+  const codes = competitions.map(c => c.code).join(',');
+  const q = new URLSearchParams({ status: 'LIVE' });
+  if (codes) q.set('competitions', codes);
+  const data = await apiFetch('/matches?' + q.toString());
+  const matches = data.matches || [];
+  upsertMatches(store, matches);
+  const history = store.matches.filter(m => m.status === 'FINISHED');
+  const predictions = matches.map(m => ensemblePrediction(m, history));
+  for (const pred of predictions) {
+    const i = store.predictions.findIndex(x => x.matchId === pred.matchId);
+    if (i >= 0) store.predictions[i] = { ...store.predictions[i], ...pred, liveUpdatedAt: new Date().toISOString() };
+    else store.predictions.push({ ...pred, liveUpdatedAt: new Date().toISOString() });
+  }
+  store.predictions = store.predictions.slice(-5000);
+  store.meta.lastLiveSync = new Date().toISOString();
+  store.meta.liveMatches = matches.length;
+  store.meta.liveSyncError = null;
+  writeStore(store);
+  return { matches, predictions, lastLiveSync: store.meta.lastLiveSync };
+}
+
+async function syncProviderDataset({ historyDays = Number(process.env.HISTORY_DAYS || 90), upcomingDays = Number(process.env.UPCOMING_DAYS || 30) } = {}) {
+  const store = readStore();
+  const competitions = await discoverCompetitions();
+  store.meta.providerCompetitions = competitions;
+  store.meta.providerCompetitionCount = competitions.length;
+
+  const today = new Date();
+  const historyFrom = isoDate(new Date(today.getTime() - historyDays * 86400000));
+  const upcomingTo = isoDate(new Date(today.getTime() + upcomingDays * 86400000));
+  const codes = competitions.map(c => c.code).join(',');
+  let syncedUpcoming = 0;
+  let syncedHistory = 0;
+  const errors = [];
+
+  // The provider can reject date ranges over 10 days. Keep every request below that limit.
+  for (const chunk of dateChunks(isoDate(today), upcomingTo, 9)) {
+    try {
+      const q = new URLSearchParams({ dateFrom: chunk.from, dateTo: chunk.to });
+      if (codes) q.set('competitions', codes);
+      const data = await apiFetch('/matches?' + q.toString());
+      const matches = data.matches || [];
+      upsertMatches(store, matches);
+      syncedUpcoming += matches.length;
+    } catch (e) {
+      errors.push({ scope: 'upcoming', ...chunk, error: e.message });
+    }
+  }
+
+  // Pull the active/current season once per discovered competition. This supplies a usable
+  // historical sample for form/Elo/backtesting without violating the date-range constraint.
+  for (const c of competitions) {
+    try {
+      const seasonYear = c.currentSeason?.startDate ? new Date(c.currentSeason.startDate).getUTCFullYear() : new Date().getUTCFullYear();
+      const data = await apiFetch(`/competitions/${encodeURIComponent(c.code)}/matches?season=${seasonYear}`);
+      const matches = data.matches || [];
+      upsertMatches(store, matches);
+      syncedHistory += matches.filter(m => m.status === 'FINISHED').length;
+    } catch (e) {
+      errors.push({ scope: 'history', competition: c.code, error: e.message });
+    }
+  }
+
+  const nowIso = new Date().toISOString();
+  store.meta.lastProviderSync = nowIso;
+  store.meta.lastHistoricalSync = nowIso;
+  store.meta.lastSyncErrors = errors.slice(-50);
+  store.meta.lastSyncStats = { syncedUpcoming, syncedHistory, competitions: competitions.length, historyDays, upcomingDays };
+  writeStore(store);
+  return { competitions, syncedUpcoming, syncedHistory, errors, stats: summarizeStore(store) };
+}
+
+function upsertMatches(store, matches = []) {
+  for (const match of matches) {
+    const i = store.matches.findIndex(x => x.id === match.id);
+    if (i >= 0) store.matches[i] = match;
+    else store.matches.push(match);
+  }
+  store.matches.sort((a, b) => new Date(a.utcDate) - new Date(b.utcDate));
+  if (store.matches.length > 10000) store.matches = store.matches.slice(-10000);
+}
+
+function teamForm(teamId, matches, venue, limit = 10) {
+  const relevant = matches
+    .filter(m => m.status === 'FINISHED')
+    .filter(m => {
+      const home = m.homeTeam?.id === teamId;
+      const away = m.awayTeam?.id === teamId;
+      if (!home && !away) return false;
+      if (venue === 'home') return home;
+      if (venue === 'away') return away;
+      return true;
+    })
+    .sort((a, b) => new Date(a.utcDate) - new Date(b.utcDate))
+    .slice(-limit);
+
+  if (!relevant.length) return { gf: 1.35, ga: 1.35, ppg: 1.2, n: 0, form: '' };
+  let gf = 0, ga = 0, pts = 0;
+  const form = [];
+  for (const m of relevant) {
+    const home = m.homeTeam.id === teamId;
+    const hg = Number(m.score?.fullTime?.home ?? 0);
+    const ag = Number(m.score?.fullTime?.away ?? 0);
+    const f = home ? hg : ag;
+    const c = home ? ag : hg;
+    gf += f; ga += c;
+    if (f > c) { pts += 3; form.push('W'); }
+    else if (f === c) { pts += 1; form.push('D'); }
+    else form.push('L');
+  }
+  return { gf: gf / relevant.length, ga: ga / relevant.length, ppg: pts / relevant.length, n: relevant.length, form: form.join('') };
+}
+
+function leagueGoalRate(matches) {
+  const finished = matches.filter(m => m.status === 'FINISHED');
+  if (!finished.length) return 1.35;
+  const goals = finished.reduce((sum, m) => sum + Number(m.score?.fullTime?.home ?? 0) + Number(m.score?.fullTime?.away ?? 0), 0);
+  return clamp(goals / finished.length / 2, 0.9, 2.2);
+}
+
+function predict(match, history) {
+  const home = teamForm(match.homeTeam.id, history, 'home');
+  const away = teamForm(match.awayTeam.id, history, 'away');
+  const league = leagueGoalRate(history);
+
+  // Transparent Poisson feature blend. It is a statistical estimate, not a guarantee.
+  let lambdaHome = (home.gf * 0.58 + (2 - home.ga) * 0.42) * 1.08;
+  let lambdaAway = (away.gf * 0.58 + (2 - away.ga) * 0.42) * 0.94;
+  lambdaHome = clamp(lambdaHome * 0.72 + league * 0.28, 0.25, 3.8);
+  lambdaAway = clamp(lambdaAway * 0.72 + league * 0.28, 0.20, 3.5);
+
+  let h = 0, d = 0, a = 0, over25 = 0, btts = 0;
+  for (let hg = 0; hg <= 8; hg++) {
+    for (let ag = 0; ag <= 8; ag++) {
+      const p = poisson(hg, lambdaHome) * poisson(ag, lambdaAway);
+      if (hg > ag) h += p;
+      else if (hg === ag) d += p;
+      else a += p;
+      if (hg + ag > 2) over25 += p;
+      if (hg > 0 && ag > 0) btts += p;
+    }
+  }
+  const total = h + d + a;
+  const probs = [h / total, d / total, a / total];
+  const markets = {
+    HOME_WIN: probs[0], DRAW: probs[1], AWAY_WIN: probs[2],
+    OVER_2_5: over25, BTTS: btts
+  };
+  const ranked = Object.entries(markets).sort((x, y) => y[1] - x[1]);
+  const [recommendedMarket, rawTopProbability] = ranked[0];
+  const entropy = -probs.reduce((s, p) => s + (p > 0 ? p * Math.log(p) : 0), 0) / Math.log(3);
+  const sampleFactor = Math.min(1, (home.n + away.n) / 16);
+  const confidence = clamp(rawTopProbability * (1 - 0.20 * entropy) * (0.82 + 0.18 * sampleFactor));
+
+  return {
+    matchId: match.id,
+    home: match.homeTeam.name,
+    away: match.awayTeam.name,
+    kickoff: match.utcDate,
+    competition: match.competition?.name || 'Unknown',
+    probabilities: {
+      homeWin: probs[0], draw: probs[1], awayWin: probs[2], over25, btts
+    },
+    expectedGoals: Number((lambdaHome + lambdaAway).toFixed(2)),
+    recommendedMarket,
+    rawTopProbability,
+    confidence,
+    risk: confidence >= 0.70 ? 'LOW' : confidence >= 0.58 ? 'MEDIUM' : 'HIGH',
+    features: { home, away, leagueGoalRate: league },
+    modelVersion: 'CRATTO-CTRL-12.0-Poisson'
+    ,dataSufficiency: { homeMatches: home.n, awayMatches: away.n, sufficient: home.n >= 5 && away.n >= 5 }
+  };
+}
+
+
+function eloRatings(matches) {
+  const ratings = new Map();
+  const K = 24;
+  const homeAdv = 55;
+  const get = id => ratings.has(id) ? ratings.get(id) : 1500;
+  const finished = [...matches].filter(m => m.status === 'FINISHED').sort((a,b)=>new Date(a.utcDate)-new Date(b.utcDate));
+  for (const m of finished) {
+    const h = m.homeTeam?.id, a = m.awayTeam?.id;
+    if (!h || !a) continue;
+    const hg = Number(m.score?.fullTime?.home ?? 0), ag = Number(m.score?.fullTime?.away ?? 0);
+    const rh = get(h), ra = get(a);
+    const eh = 1 / (1 + Math.pow(10, ((ra - (rh + homeAdv)) / 400)));
+    const outcome = hg > ag ? 1 : hg === ag ? .5 : 0;
+    const margin = Math.min(1.5, 1 + Math.log1p(Math.abs(hg-ag)) * .18);
+    ratings.set(h, rh + K * margin * (outcome - eh));
+    ratings.set(a, ra + K * margin * ((1-outcome) - (1-eh)));
+  }
+  return ratings;
+}
+function eloProbabilities(match, ratings) {
+  const rh = ratings.get(match.homeTeam.id) ?? 1500;
+  const ra = ratings.get(match.awayTeam.id) ?? 1500;
+  const x = (rh + 55 - ra) / 400;
+  const homeNonDraw = 1 / (1 + Math.pow(10, -x));
+  const draw = clamp(0.27 - Math.min(.08, Math.abs(x) * .06), .16, .29);
+  return { homeWin: homeNonDraw * (1-draw), draw, awayWin: (1-homeNonDraw) * (1-draw) };
+}
+function trend(teamId, matches, limit=8) {
+  const games = matches.filter(m=>m.status==='FINISHED' && (m.homeTeam?.id===teamId || m.awayTeam?.id===teamId))
+    .sort((a,b)=>new Date(a.utcDate)-new Date(b.utcDate)).slice(-limit);
+  if (games.length < 4) return { slope: 0, direction: 'STABLE' };
+  const vals = games.map(m=>{
+    const home=m.homeTeam.id===teamId, gf=Number(m.score?.fullTime?.home??0), ga=Number(m.score?.fullTime?.away??0);
+    return home ? gf-ga : ga-gf;
+  });
+  const n=vals.length, xbar=(n-1)/2, ybar=vals.reduce((a,b)=>a+b,0)/n;
+  const den=vals.reduce((a,_,i)=>a+(i-xbar)**2,0)||1;
+  const slope=vals.reduce((a,y,i)=>a+(i-xbar)*(y-ybar),0)/den;
+  return { slope:Number(slope.toFixed(3)), direction:slope>.08?'UP':slope<-.08?'DOWN':'STABLE' };
+}
+function ensemblePrediction(match, history) {
+  const base = predict(match, history);
+  const ratings = eloRatings(history);
+  const elo = eloProbabilities(match, ratings);
+  const formHome = base.features.home.ppg, formAway = base.features.away.ppg;
+  const formEdge = clamp(.5 + (formHome-formAway)/6, .18, .82);
+  const form = { homeWin: formEdge*.72, draw:.28, awayWin:(1-formEdge)*.72 };
+  const weights = history.length >= 100 ? { poisson:.55, elo:.30, form:.15 } : { poisson:.70, elo:.20, form:.10 };
+  const probs3 = {
+    homeWin: clamp(weights.poisson*base.probabilities.homeWin + weights.elo*elo.homeWin + weights.form*form.homeWin),
+    draw: clamp(weights.poisson*base.probabilities.draw + weights.elo*elo.draw + weights.form*form.draw),
+    awayWin: clamp(weights.poisson*base.probabilities.awayWin + weights.elo*elo.awayWin + weights.form*form.awayWin)
+  };
+  const sum=probs3.homeWin+probs3.draw+probs3.awayWin;
+  probs3.homeWin/=sum; probs3.draw/=sum; probs3.awayWin/=sum;
+  const markets={HOME_WIN:probs3.homeWin,DRAW:probs3.draw,AWAY_WIN:probs3.awayWin,OVER_2_5:base.probabilities.over25,BTTS:base.probabilities.btts};
+  const ranked=Object.entries(markets).sort((a,b)=>b[1]-a[1]);
+  const entropy=-[probs3.homeWin,probs3.draw,probs3.awayWin].reduce((s,p)=>s+(p>0?p*Math.log(p):0),0)/Math.log(3);
+  const calibrationFactor=history.length>=150 ? .98 : history.length>=50 ? .94 : .88;
+  const confidence=clamp(ranked[0][1]*(1-.16*entropy)*calibrationFactor);
+  const ht=trend(match.homeTeam.id,history), at=trend(match.awayTeam.id,history);
+  return {...base, probabilities:{...base.probabilities,...probs3}, recommendedMarket:ranked[0][0], rawTopProbability:ranked[0][1], confidence,
+    risk:confidence>=.70?'LOW':confidence>=.58?'MEDIUM':'HIGH', modelVersion:'CRATTO-CTRL-24.0-AUTH-PORTFOLIO',
+    modelBlend:weights, elo:{home:ratings.get(match.homeTeam.id)??1500,away:ratings.get(match.awayTeam.id)??1500,probabilities:elo}, trend:{home:ht,away:at}, calibrationFactor};
+}
+function evaluateEnsemble(pred, match) {
+  const e=evaluatePrediction(pred,match);
+  const arr=[pred.probabilities.homeWin,pred.probabilities.draw,pred.probabilities.awayWin];
+  const actual=match.score.fullTime.home>match.score.fullTime.away?0:match.score.fullTime.home===match.score.fullTime.away?1:2;
+  e.logLoss=-Math.log(Math.max(1e-9,arr[actual]));
+  return e;
+}
+function correlationScore(a,b) {
+  if (a.recommendedMarket===b.recommendedMarket) return .8;
+  const homeAway = new Set([a.home,a.away,a.matchId,b.home,b.away,b.matchId]);
+  if (homeAway.size < 6) return .55;
+  if ((a.probabilities?.over25 && b.probabilities?.btts) || (a.probabilities?.btts && b.probabilities?.over25)) return .35;
+  return 0;
+}
+function buildPortfolio(predictions, opts={}) {
+  const maxSelections=Math.max(1,Math.min(20,Number(opts.maxSelections||5)));
+  const minConfidence=clamp(Number(opts.minConfidence??.65));
+  const risk=opts.risk||'ALL';
+  const pool=predictions.filter(p=>p.confidence>=minConfidence&&(risk==='ALL'||p.risk===risk)).sort((a,b)=>b.confidence-a.confidence);
+  const selected=[];
+  for(const p of pool){
+    if(selected.length>=maxSelections) break;
+    const tooCorrelated=selected.some(x=>correlationScore(x,p)>=.75);
+    if(!tooCorrelated) selected.push(p);
+  }
+  return selected;
+}
+
+
+function evaluatePrediction(prediction, match) {
+  const hg = Number(match.score?.fullTime?.home ?? 0);
+  const ag = Number(match.score?.fullTime?.away ?? 0);
+  const actual = hg > ag ? 'HOME_WIN' : hg === ag ? 'DRAW' : 'AWAY_WIN';
+  const p = prediction.probabilities;
+  const actualIndex = actual === 'HOME_WIN' ? 0 : actual === 'DRAW' ? 1 : 2;
+  const arr = [p.homeWin, p.draw, p.awayWin];
+  const brier = arr.reduce((s, x, i) => s + Math.pow(x - (i === actualIndex ? 1 : 0), 2), 0);
+  return {
+    matchId: match.id,
+    actual,
+    predicted: ['HOME_WIN', 'DRAW', 'AWAY_WIN'][arr.indexOf(Math.max(...arr))],
+    correct: arr.indexOf(Math.max(...arr)) === actualIndex,
+    brier
+  };
+}
+
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return `${salt}:${hash}`;
+}
+function verifyPassword(password, stored) {
+  const [salt, hash] = String(stored || '').split(':');
+  if (!salt || !hash) return false;
+  const derived = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(derived, 'hex'));
+}
+function token() { return crypto.randomBytes(32).toString('hex'); }
+function shareCode() { return `CCTRL-${crypto.randomBytes(4).toString('hex').toUpperCase()}`; }
+function normalizeEmail(value) { return String(value || '').trim().toLowerCase(); }
+function safeUser(u) { return u ? { id:u.id, name:u.name, email:u.email, role:u.role, createdAt:u.created_at || u.createdAt } : null; }
+function tokenFromReq(req) { const raw=req.headers.authorization||''; return raw.startsWith('Bearer ')?raw.slice(7):null; }
+function adminAuthorized(req) {
+  const key = process.env.ADMIN_KEY;
+  const supplied = req.headers['x-admin-key'] || req.query.adminKey;
+  return Boolean(key && supplied && safeCompare(key, supplied));
+}
+function bookmakerSlip(selections, bookmaker='CRATTO') {
+  const normalized=String(bookmaker||'CRATTO').toUpperCase();
+  const supported=['CRATTO','BETWAY','HOLLYWOODBETS'];
+  if(!supported.includes(normalized)) throw new Error('Unsupported bookmaker target.');
+  const rows=(Array.isArray(selections)?selections:[]).map((s,i)=>({
+    leg:i+1,
+    fixture:`${s.home} vs ${s.away}`,
+    market:s.recommendedMarket||s.market||'UNSPECIFIED',
+    probability:s.confidence ?? s.rawTopProbability ?? null,
+    kickoff:s.kickoff||null,
+    competition:s.competition||null
+  }));
+  return {
+    bookmaker:normalized,
+    mode: normalized==='CRATTO'?'CRATTO_SHARE_CODE':'BOOKMAKER_READY',
+    title: normalized==='BETWAY'?'Betway-ready slip':normalized==='HOLLYWOODBETS'?'Hollywoodbets-ready slip':'CRATTO CTRL slip',
+    instructions: normalized==='BETWAY'
+      ? 'Transfer these selections into Betway, then use Betway Book-a-Bet to generate the official Betway booking code.'
+      : normalized==='HOLLYWOODBETS'
+      ? 'Transfer these selections into Hollywoodbets and use its own sharing/booking workflow to obtain the official bookmaker reference.'
+      : 'Share this CRATTO CTRL code with another CRATTO user.',
+    selections:rows
+  };
+}
+
+async function authUser(req) {
+  const token=tokenFromReq(req); if(!token) return null;
+  if(dbEnabled) { const s=await getSession(token); return s ? await getUserById(s.user_id) : null; }
+  const store=readStore(); const s=store.sessions.find(x=>x.token===token && new Date(x.expiresAt)>new Date()); return s ? store.users.find(u=>u.id===s.userId) || null : null;
+}
+
+async function requireAuth(req,res,next) {
+  try { const user = await authUser(req); if (!user) return res.status(401).json({error:'Login required'}); req.user = user; next(); }
+  catch(e) { res.status(500).json({error:e.message}); }
+}
