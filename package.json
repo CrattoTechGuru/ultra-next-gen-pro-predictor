@@ -1,8 +1,9 @@
 {
-  "name":"ultra-next-gen-pro-predictor-v1000-combined",
-  "version":"1000.1.0",
-  "private":true,
-  "type":"module",
-  "scripts":{"start":"node server.js"},
-  "dependencies":{"express":"^5.1.0","dotenv":"^17.2.2"}
+  "name": "ultra-next-gen-pro-predictor",
+  "version": "1000.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {"start": "node server.js"},
+  "engines": {"node": ">=20"},
+  "dependencies": {"dotenv": "^17.2.2", "express": "^5.1.0", "pg": "^8.16.3"}
 }
